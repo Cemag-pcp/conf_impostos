@@ -1,0 +1,6 @@
+playwright
+python-dotenv
+pandas
+openpyxl
+gspread
+google-auth
