@@ -36,5 +36,12 @@ setup_projeto.bat
 python main.py
 ```
 
-**Roda desacompanhado (agendado de madrugada) — sempre usa a data de hoje**
-como Emissão Início/Fim, sem precisar de nenhum argumento.
+**Roda desacompanhado (agendado de madrugada) — por padrão usa a data de
+hoje** como Emissão Início/Fim, sem precisar de nenhum argumento.
+
+Pra rodar manualmente com outro período (ex.: reprocessar um dia
+específico), use `--inicio`/`--fim` (aceita `DD/MM/AAAA` ou `DDMMAAAA`):
+
+```
+python main.py --inicio 25/08/2026 --fim 26/08/2026
+```

@@ -23,8 +23,10 @@ detalhamento por item — pura leitura de arquivo, não depende do navegador.
 """
 
 import os
+import re
 import time
 import logging
+import argparse
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -210,6 +212,30 @@ def pesquisar_no_sistema(page: Page, termo: str):
     page.wait_for_timeout(1500)
 
 
+def fechar_abas_de(page: Page, prefixo_nome: str):
+    """
+    Fecha todas as abas cujo nome comece com `prefixo_nome`. Necessário
+    antes de reabrir um relatório (ex.: numa retentativa): toda navegação
+    via pesquisa do sistema abre uma aba NOVA mesmo se a mesma tela já
+    estiver aberta — sem fechar a(s) antiga(s), acumulam-se várias abas do
+    mesmo relatório abertas ao mesmo tempo, e uma busca de texto por botão
+    (ex.: "Executar", via CDP `click_text`) pode achar/clicar o elemento da
+    aba ANTIGA (já usada, sem efeito nenhum de verdade) em vez da aba nova.
+    Confirmado ao vivo (27/08/2026): numa retentativa sem fechar a aba
+    anterior, o log registrava o clique em "Executar" normalmente, mas
+    nada acontecia na tela — o link de download nunca chegava a aparecer.
+    """
+    while True:
+        tab = page.get_by_role("tab", name=re.compile(rf"^{re.escape(prefixo_nome)}", re.IGNORECASE))
+        if tab.count() == 0:
+            break
+        try:
+            tab.first.get_by_role("button", name="Fechar").click()
+            page.wait_for_timeout(300)
+        except Exception:
+            break
+
+
 def abrir_relatorio(page: Page, nome_exato: str, timeout_ms: int = 15000):
     """Abre um relatório pelo nome exato (listado na pesquisa do sistema)."""
     log.info(f"Abrindo relatório '{nome_exato}'...")
@@ -285,7 +311,7 @@ def executar_download_xml(page: Page, cdp, data_inicial: str, data_final: str):
     aguardar_acao_completar(page, wait_ms=1500, timeout_total_ms=120000)
 
 
-def baixar_zip_xml(page: Page, timeout_ms: int = 30000) -> Path | None:
+def baixar_zip_xml(page: Page, timeout_ms: int = 60000) -> Path | None:
     """
     Depois de executar_download_xml, a tela de resultado mostra um ícone/link
     real (DOM normal, não Shadow DOM — <a href="http://monitor.nfemonitor.com.br/dfe?zip=...">
@@ -305,6 +331,16 @@ def baixar_zip_xml(page: Page, timeout_ms: int = 30000) -> Path | None:
          evento de download) — confirmado ao vivo aguardando >90s sem o
          .zip nunca ficar pronto. Só dá pra saber tentando o download e
          esperando um tempo limitado pelo evento de fato.
+
+    IMPORTANTE sobre o timeout: pra períodos maiores (ex.: 8 dias, 65
+    baixas), o servidor externo genuinamente demora ~33s pra gerar o zip —
+    confirmado ao vivo (27/08/2026): um arquivo completo e correto (mesmo
+    tamanho de um fetch direto bem-sucedido) apareceu no diretório de
+    artefatos temporário do Playwright, só que ALGUNS SEGUNDOS DEPOIS do
+    timeout antigo de 30s já ter desistido e fechado a aba — ou seja, o
+    download acontecia de verdade, só não dava tempo de ser capturado.
+    `timeout_ms` (60s por padrão) precisa ter folga sobre esse tempo real
+    de geração, não só sobre uma resposta instantânea.
 
     O clique pode disparar o download na própria aba OU abrir uma aba nova
     (o link é target="_blank") dependendo de como o servidor responde — por
@@ -337,7 +373,27 @@ def baixar_zip_xml(page: Page, timeout_ms: int = 30000) -> Path | None:
     def _capturar(download):
         download_holder["download"] = download
 
-    context.on("download", _capturar)
+    def _nova_pagina(nova_page):
+        # A aba nova (target="_blank") também pode ser onde o download
+        # efetivamente acontece — precisa escutar "download" nela também.
+        nova_page.on("download", _capturar)
+
+    # BUG CRÍTICO já corrigido aqui: `BrowserContext` NÃO tem evento
+    # "download" nesta versão do Playwright (só "close", "page", "dialog",
+    # "console", "request(failed/finished)", "response", "weberror",
+    # "serviceworker" — confirmado lendo Events em
+    # playwright/_impl/_browser_context.py). Só `Page` emite "download".
+    # A versão anterior deste código fazia `context.on("download", ...)`,
+    # que registrava um listener pra um evento que NUNCA é disparado — o
+    # callback simplesmente nunca rodava, não importa quanto tempo se
+    # esperasse. Confirmado ao vivo (27/08/2026): em 3 tentativas seguidas,
+    # o arquivo baixava por completo e com o tamanho certo (visto direto no
+    # diretório de artefatos temporário do Playwright), mas o script achava
+    # que tinha falhado igual, porque nunca escutava o evento certo. Por
+    # isso agora escuta em CADA `Page` (a original e qualquer aba nova
+    # aberta via popup) em vez do `context`.
+    page.on("download", _capturar)
+    page.on("popup", _nova_pagina)
     try:
         paginas_antes = set(context.pages)
         link.click()
@@ -345,7 +401,8 @@ def baixar_zip_xml(page: Page, timeout_ms: int = 30000) -> Path | None:
         while (time.time() - inicio_download) * 1000 < timeout_ms and "download" not in download_holder:
             page.wait_for_timeout(500)
     finally:
-        context.remove_listener("download", _capturar)
+        page.remove_listener("download", _capturar)
+        page.remove_listener("popup", _nova_pagina)
 
     if "download" not in download_holder:
         # Fecha qualquer aba nova em branco que o clique tenha aberto, pra
@@ -893,26 +950,86 @@ def fluxo_baixas_recursos_nfe(page: Page, cdp, emissao_inicio: str, emissao_fim:
     return formatar_tabela(df)
 
 
-def fluxo_download_xml_manifestados(page: Page, cdp, data_inicial: str, data_final: str) -> Path | None:
+def fluxo_download_xml_manifestados(page: Page, cdp, data_inicial: str, data_final: str, tentativas: int = 3) -> Path | None:
     """
     Abre o relatório "99003 Download de XML Manifestados (C)", filtra pelo
     período informado, executa e baixa o .zip com os XMLs das NFes. Retorna
-    None se não houver nenhuma NFe manifestada no período.
+    None se não houver nenhuma NFe manifestada no período (ou se todas as
+    tentativas esgotarem sem sucesso).
+
+    O serviço externo que gera o zip (monitor.nfemonitor.com.br) é instável
+    — confirmado ao vivo (27/08/2026) uma tentativa falhar (30s sem nenhum
+    arquivo, período com 65 baixas lançadas — muito improvável não ter NFe
+    nenhuma) e, minutos depois, o MESMO relatório gerar o zip certo em menos
+    de 1 segundo. Por isso, em vez de desistir na primeira falha, reabre o
+    relatório do zero e tenta de novo até `tentativas` vezes antes de
+    retornar None.
+
+    Cada tentativa é protegida por try/except: além do "sem resultados"
+    gracioso (`baixar_zip_xml` retornando None), a mesma instabilidade pode
+    se manifestar como uma exceção de verdade (ex.: o link nem chega a
+    aparecer — `TimeoutError`, confirmado ao vivo também). Sem capturar
+    isso aqui, uma exceção numa tentativa intermediária derrubava a função
+    inteira e pulava as tentativas seguintes, o que ia contra o próprio
+    propósito da retentativa.
+
+    IMPORTANTE: fecha a aba do relatório antes de reabrir (seção 14 do
+    BOAS_PRATICAS) — reabrir sem fechar deixa a aba antiga (já usada) aberta
+    ao mesmo tempo que a nova, e a busca de texto por "Executar" (via CDP)
+    pode acabar clicando no botão da aba ERRADA (antiga, sem efeito nenhum).
+    Confirmado ao vivo (27/08/2026): sem fechar a aba antiga, as 3 tentativas
+    falhavam igual, sempre com "o link nem chegou a aparecer" — o clique em
+    "Executar" era registrado no log mas não fazia nada na tela.
     """
-    abrir_relatorio(page, NOME_RELATORIO_XML)
-    executar_download_xml(page, cdp, data_inicial, data_final)
-    return baixar_zip_xml(page)
+    for tentativa in range(1, tentativas + 1):
+        try:
+            fechar_abas_de(page, "99003")
+            abrir_relatorio(page, NOME_RELATORIO_XML)
+            executar_download_xml(page, cdp, data_inicial, data_final)
+            caminho = baixar_zip_xml(page)
+        except Exception as exc:
+            caminho = None
+            log.warning(f"  → Tentativa {tentativa}/{tentativas} de baixar o ZIP falhou com erro ({exc}).")
+
+        if caminho is not None:
+            return caminho
+
+        if tentativa < tentativas:
+            log.warning(f"  → Tentativa {tentativa}/{tentativas} sem sucesso — reabrindo o relatório e tentando de novo...")
+            page.wait_for_timeout(5000)
+
+    log.warning(f"  → Todas as {tentativas} tentativas de baixar o ZIP falharam.")
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Ponto de entrada
 # ---------------------------------------------------------------------------
 
+def _tipo_data_arg(valor: str) -> str:
+    """Aceita DD/MM/AAAA ou DDMMAAAA na linha de comando e devolve sempre no formato DDMMAAAA usado pelos filtros do ERP."""
+    valor = valor.strip()
+    for fmt in ("%d/%m/%Y", "%d%m%Y"):
+        try:
+            return datetime.strptime(valor, fmt).strftime("%d%m%Y")
+        except ValueError:
+            continue
+    raise argparse.ArgumentTypeError(f"Data inválida: '{valor}' (use DD/MM/AAAA ou DDMMAAAA)")
+
+
 def main():
-    # Roda desacompanhado (agendado de madrugada) — sempre usa a data de hoje
-    # como início e fim do período, sem depender de argumento nenhum.
+    # Roda desacompanhado (agendado de madrugada) e por padrão usa a data de
+    # hoje como início e fim do período, sem precisar de argumento nenhum —
+    # mas aceita --inicio/--fim pra rodar manualmente com outro período
+    # (ex.: reprocessar um dia específico) sem precisar editar o código.
+    parser = argparse.ArgumentParser(description="Automação de Verificação de NF — Innovaro ERP")
+    parser.add_argument("--inicio", type=_tipo_data_arg, help="Emissão início do período (DD/MM/AAAA ou DDMMAAAA). Padrão: hoje.")
+    parser.add_argument("--fim", type=_tipo_data_arg, help="Emissão fim do período (DD/MM/AAAA ou DDMMAAAA). Padrão: hoje.")
+    args = parser.parse_args()
+
     hoje = datetime.now().strftime("%d%m%Y")
-    emissao_inicio = emissao_fim = hoje
+    emissao_inicio = args.inicio or hoje
+    emissao_fim = args.fim or hoje
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     log.info("Iniciando automação de Verificação de NF...")
